@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000">
+<link rel="manifest" href="manifest.json">
+<title>Peaks AR</title>
+<style>
+  :root{--fg:#fff;--accent:#ffd166;--bg:rgba(0,0,0,.55)}
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#000;color:var(--fg);font:14px/1.3 -apple-system,system-ui,sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none}
+  #cam{position:fixed;inset:0;width:100%;height:100%;object-fit:cover}
+  #ar{position:fixed;inset:0;pointer-events:none}
+  .pk{position:absolute;transform:translate(-50%,-100%);text-align:center;white-space:nowrap;will-change:left,top}
+  .pk .l{display:inline-block;background:var(--bg);backdrop-filter:blur(4px);padding:3px 7px;border-radius:6px;font-weight:600;font-size:13px}
+  .pk .l small{display:block;font-weight:400;font-size:11px;opacity:.85}
+  .pk .t{width:1px;height:26px;background:var(--accent);margin:0 auto}
+  .pk .d{width:7px;height:7px;border-radius:50%;background:var(--accent);margin:0 auto}
+  .pk.far .l{font-size:11px;opacity:.8}.pk.far .t{height:14px}
+  #compass{position:fixed;top:0;left:0;right:0;height:44px;padding-top:env(safe-area-inset-top);background:linear-gradient(#000a,#0000);overflow:hidden;pointer-events:none}
+  #ticks{position:absolute;bottom:6px;left:50%;height:22px;white-space:nowrap;will-change:transform}
+  #ticks span{position:absolute;bottom:0;transform:translateX(-50%);font-size:11px;font-weight:600;opacity:.9}
+  #ticks i{position:absolute;bottom:0;width:1px;height:6px;background:#fff8}
+  #compass:after{content:"";position:absolute;left:50%;bottom:0;width:2px;height:30px;background:var(--accent);transform:translateX(-50%)}
+  #hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:linear-gradient(#0000,#000c);display:flex;justify-content:space-between;align-items:flex-end;font-size:12px;gap:8px}
+  #hud b{font-size:15px;color:var(--accent)}
+  #status{opacity:.85;max-width:60%}
+  button{font:inherit;color:#000;background:var(--accent);border:0;border-radius:8px;padding:8px 12px;font-weight:700}
+  #gear{background:#0009;color:#fff;padding:8px 10px}
+  #start{position:fixed;inset:0;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;z-index:9}
+  #start h1{font-size:28px}#start p{opacity:.7;max-width:320px}
+  #start button{padding:14px 28px;font-size:17px}
+  #settings{position:fixed;left:0;right:0;bottom:0;background:#111;padding:16px 16px calc(16px + env(safe-area-inset-bottom));border-radius:14px 14px 0 0;display:none;z-index:8}
+  #settings.open{display:block}
+  #settings label{display:flex;justify-content:space-between;margin:10px 0 4px;font-size:13px}
+  #settings input[type=range]{width:100%}
+  #settings .row{display:flex;gap:8px;margin-top:12px}
+  #settings .row button{flex:1}
+  #horizon{position:fixed;left:0;right:0;height:1px;background:#fff3;pointer-events:none}
+</style>
+</head>
+<body>
+<video id="cam" autoplay muted playsinline></video>
+<div id="horizon"></div>
+<div id="ar"></div>
+<div id="compass"><div id="ticks"></div></div>
+<div id="hud">
+  <div id="status">…</div>
+  <div style="text-align:right"><b id="hdg">—</b><br><span id="pos">no fix</span></div>
+  <button id="gear" onclick="settings.classList.toggle('open')">⚙︎</button>
+</div>
+<div id="settings">
+  <label>Camera field of view <span id="fovV"></span></label><input type="range" id="fov" min="30" max="90" step="1">
+  <label>Compass correction <span id="offV"></span></label><input type="range" id="off" min="-45" max="45" step="1">
+  <label>Search radius <span id="radV"></span></label><input type="range" id="rad" min="5" max="50" step="5">
+  <label>Min. peak height <span id="minV"></span></label><input type="range" id="min" min="0" max="3000" step="100">
+  <div class="row"><button onclick="reloadPeaks()">Reload peaks</button><button style="background:#333;color:#fff" onclick="settings.classList.remove('open')">Close</button></div>
+</div>
+<div id="start">
+  <h1>⛰ Peaks AR</h1>
+  <p>Point your camera at the mountains to see peak names, heights and distances. Needs camera, location and motion access.</p>
+  <button onclick="start()">Start</button>
+  <p id="startErr" style="color:#f88"></p>
+</div>
+
+<script>
+// ---- config (persisted) ----
+const cfg = Object.assign({fov:55, off:0, rad:25, min:0}, JSON.parse(localStorage.cfg||'{}'));
+for (const k of ['fov','off','rad','min']) {
+  const el = document.getElementById(k), v = document.getElementById(k+'V');
+  el.value = cfg[k];
+  const show = () => v.textContent = k==='off'?`${cfg[k]>0?'+':''}${cfg[k]}°` : k==='fov'?`${cfg[k]}°` : k==='rad'?`${cfg[k]} km` : `${cfg[k]} m`;
+  show();
+  el.oninput = () => { cfg[k] = +el.value; show(); localStorage.cfg = JSON.stringify(cfg); if (k==='rad'||k==='min') needFetch = true; };
+}
+
+// ---- state ----
+const R = 6371000, D2R = Math.PI/180;
+let me = null;          // {lat, lon, ele}
+let heading = null, pitch = 0;
+let peaks = [];         // [{name, lat, lon, ele, bearing, dist, elevAng}]
+let needFetch = true, fetchedAt = null, fetching = false;
+const $ = id => document.getElementById(id);
+
+// ---- start: permissions need a user gesture (iOS) ----
+async function start() {
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
+      if (await DeviceOrientationEvent.requestPermission() !== 'granted') throw new Error('Motion access denied');
+    }
+    $('cam').srcObject = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:1920}}, audio:false});
+  } catch (e) { $('startErr').textContent = e.message; return; }
+  $('start').remove();
+  // Android: absolute event has magnetometer-referenced alpha. iOS: plain event + webkitCompassHeading.
+  window.addEventListener('deviceorientationabsolute', onOrient, true);
+  window.addEventListener('deviceorientation', onOrient, true);
+  navigator.geolocation.watchPosition(onPos, e => status('GPS: '+e.message), {enableHighAccuracy:true, maximumAge:5000, timeout:20000});
+  requestAnimationFrame(render);
+}
+
+let gotAbsolute = false;
+function onOrient(e) {
+  if (e.type === 'deviceorientationabsolute') gotAbsolute = true;
+  else if (gotAbsolute) return; // prefer absolute stream on Android
+  if (e.alpha == null) return;
+  const a = e.alpha*D2R, b = e.beta*D2R, g = e.gamma*D2R;
+  // Direction the back camera points (device -Z) in East/North/Up frame; R = Rz(a)·Rx(b)·Ry(g)
+  const vx = -(Math.cos(a)*Math.sin(g) + Math.sin(a)*Math.sin(b)*Math.cos(g));
+  const vy = -(Math.sin(a)*Math.sin(g) - Math.cos(a)*Math.sin(b)*Math.cos(g));
+  const vz = -(Math.cos(b)*Math.cos(g));
+  pitch = Math.asin(Math.max(-1, Math.min(1, vz))) / D2R;
+  let h;
+  if (e.webkitCompassHeading != null) h = e.webkitCompassHeading;          // iOS: already true-north-ish, valid when upright
+  else if (e.absolute || e.type === 'deviceorientationabsolute') h = Math.atan2(vx, vy) / D2R;
+  else { status('Compass not absolute – heading unreliable'); h = Math.atan2(vx, vy) / D2R; }
+  // ponytail: no roll compensation; hold phone roughly level
+  heading = ((h + cfg.off) % 360 + 360) % 360;
+}
+
+async function onPos(p) {
+  const {latitude:lat, longitude:lon, altitude:alt, accuracy} = p.coords;
+  const first = !me;
+  me = {lat, lon, ele: me?.ele ?? alt ?? 0};
+  $('pos').textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)} · ±${Math.round(accuracy)}m`;
+  if (first || needFetch || dist(me, fetchedAt||me) > 3000) {
+    needFetch = false;
+    groundElevation(lat, lon).then(e => { if (e != null) me.ele = e + 2; recompute(); });
+    loadPeaks(lat, lon);
+  } else recompute();
+}
+
+// GPS altitude on phones is noisy/absent; use DEM lookup (open-meteo, free, no key). Falls back to GPS alt.
+async function groundElevation(lat, lon) {
+  try {
+    const r = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`);
+    return (await r.json()).elevation?.[0];
+  } catch { return null; }
+}
+
+function reloadPeaks() { settings.classList.remove('open'); if (me) loadPeaks(me.lat, me.lon, true); }
+
+async function loadPeaks(lat, lon, force) {
+  if (fetching) return;
+  const key = `peaks:${lat.toFixed(2)},${lon.toFixed(2)},${cfg.rad}`;
+  const cached = !force && localStorage.getItem(key);
+  if (cached) { peaks = JSON.parse(cached); fetchedAt = {lat, lon}; recompute(); status(`${peaks.length} peaks (cached)`); return; }
+  fetching = true; status('Loading peaks from OpenStreetMap…');
+  const q = `[out:json][timeout:25];node["natural"="peak"]["name"]["ele"](around:${cfg.rad*1000},${lat},${lon});out body;`;
+  const endpoints = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+  for (const url of endpoints) {
+    try {
+      const r = await fetch(url, {method:'POST', body:'data='+encodeURIComponent(q)});
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      peaks = j.elements.map(n => ({name:n.tags.name, lat:n.lat, lon:n.lon, ele:parseFloat(String(n.tags.ele).replace(',','.'))})).filter(p => isFinite(p.ele));
+      fetchedAt = {lat, lon};
+      try { localStorage.setItem(key, JSON.stringify(peaks)); } catch {}
+      recompute(); status(`${peaks.length} peaks within ${cfg.rad} km`);
+      fetching = false; return;
+    } catch (e) { console.warn(url, e); }
+  }
+  fetching = false; status('Peak download failed – check connection');
+}
+
+function dist(a, b) {
+  const dLat = (b.lat-a.lat)*D2R, dLon = (b.lon-a.lon)*D2R;
+  const s = Math.sin(dLat/2)**2 + Math.cos(a.lat*D2R)*Math.cos(b.lat*D2R)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+function bearing(a, b) {
+  const φ1=a.lat*D2R, φ2=b.lat*D2R, dλ=(b.lon-a.lon)*D2R;
+  const y=Math.sin(dλ)*Math.cos(φ2), x=Math.cos(φ1)*Math.sin(φ2)-Math.sin(φ1)*Math.cos(φ2)*Math.cos(dλ);
+  return (Math.atan2(y,x)/D2R+360)%360;
+}
+function recompute() {
+  if (!me) return;
+  for (const p of peaks) {
+    p.dist = dist(me, p); p.bearing = bearing(me, p);
+    // elevation angle incl. earth curvature + standard refraction (k≈0.13)
+    const drop = p.dist*p.dist/(2*R)*(1-0.13);
+    p.elevAng = Math.atan2(p.ele - me.ele - drop, p.dist)/D2R;
+  }
+  peaks.sort((a,b) => a.dist-b.dist);
+}
+
+// ---- render ----
+const ar = $('ar'), ticks = $('ticks'), hdgEl = $('hdg');
+(function buildTicks(){ // 3 turns so we can scroll seamlessly
+  const N = {0:'N',90:'E',180:'S',270:'W'}; let h = '';
+  for (let d = -360; d < 720; d += 15) h += d%90===0 ? `<span data-d="${d}">${N[(d+360)%360]}</span>` : `<i data-d="${d}"></i>`;
+  ticks.innerHTML = h;
+})();
+const PX_PER_DEG = () => innerWidth / cfg.fov;
+const labelCache = new Map();
+
+function render() {
+  requestAnimationFrame(render);
+  if (heading == null) return;
+  hdgEl.textContent = `${Math.round(heading)}° ${['N','NE','E','SE','S','SW','W','NW'][Math.round(heading/45)%8]}`;
+  const ppd = PX_PER_DEG(), W = innerWidth, H = innerHeight;
+  // compass strip
+  for (const el of ticks.children) el.style.left = (( +el.dataset.d - heading) * ppd*0.6) + 'px';
+  // horizon line
+  $('horizon').style.top = (H/2 + pitch*ppd) + 'px';
+  // peaks
+  const halfFov = cfg.fov/2 + 4, cols = {};
+  let shown = 0;
+  const seen = new Set();
+  for (const p of peaks) {
+    if (p.dist == null || p.ele < cfg.min || p.dist < 150) continue;
+    let rel = p.bearing - heading; rel = ((rel + 540) % 360) - 180;
+    if (Math.abs(rel) > halfFov) continue;
+    const x = W/2 + rel*ppd, y = H/2 - (p.elevAng - pitch)*ppd;
+    if (y < -50 || y > H + 50) continue;
+    if (++shown > 40) break;
+    // ponytail: no terrain occlusion (needs DEM raycasting); stack overlapping labels instead
+    const col = Math.round(x/64); const n = cols[col] = (cols[col]||0) + 1;
+    let el = labelCache.get(p);
+    if (!el) {
+      el = document.createElement('div'); el.className = 'pk';
+      el.innerHTML = `<div class="l">${p.name}<small></small></div><div class="t"></div><div class="d"></div>`;
+      labelCache.set(p, el);
+    }
+    if (!el.isConnected) ar.appendChild(el);
+    el.classList.toggle('far', p.dist > 12000);
+    el.querySelector('small').textContent = `${Math.round(p.ele)} m · ${(p.dist/1000).toFixed(1)} km`;
+    el.style.left = x + 'px'; el.style.top = y + 'px';
+    el.style.paddingBottom = ((n-1)*40) + 'px';
+    el.style.zIndex = 1000 - Math.round(p.dist/100);
+    seen.add(p);
+  }
+  for (const [p, el] of labelCache) if (!seen.has(p) && el.isConnected) el.remove();
+}
+function status(t) { $('status').textContent = t; }
+</script>
+</body>
+</html>
