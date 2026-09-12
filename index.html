@@ -108,8 +108,15 @@ function watchGPS() {
     $('status').innerHTML = 'Location blocked. Open in Safari/Chrome itself (not an in-app browser).'
       + '<br>iOS: Settings › Privacy › Location Services › Safari Websites › While Using; Settings › Safari › Location › Ask.'
       + '<br>Android: lock icon › Permissions › Location › Allow. '
-      + '<button onclick="watchGPS()" style="padding:4px 8px;margin-top:4px">Retry</button>';
+      + '<button onclick="watchGPS()" style="padding:4px 8px;margin-top:4px">Retry</button><br><small id="diag"></small>';
+    diag();
   }, {enableHighAccuracy:true, maximumAge:5000, timeout:20000});
+}
+async function diag() { // shown under the denied message: helps tell OS block vs per-site deny vs in-app browser
+  let perm = 'n/a';
+  try { perm = (await navigator.permissions.query({name:'geolocation'})).state; } catch {}
+  const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+  $('diag').textContent = `perm=${perm} standalone=${standalone} secure=${isSecureContext} ua=${navigator.userAgent.slice(0,90)}`;
 }
 
 let gotAbsolute = false;
