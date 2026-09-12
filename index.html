@@ -28,6 +28,7 @@
   #hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:linear-gradient(#0000,#000c);display:flex;justify-content:space-between;align-items:flex-end;font-size:12px;gap:8px}
   #hud b{font-size:15px;color:var(--accent)}
   #status{opacity:.85;max-width:60%;pointer-events:auto}
+  #hint{position:fixed;left:0;right:0;top:calc(52px + env(safe-area-inset-top));text-align:center;font-size:12px;opacity:.8;pointer-events:none}
   button{font:inherit;color:#000;background:var(--accent);border:0;border-radius:8px;padding:8px 12px;font-weight:700}
   #gear{background:#0009;color:#fff;padding:8px 10px}
   #start{position:fixed;inset:0;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;z-index:9}
@@ -46,6 +47,7 @@
 <video id="cam" autoplay muted playsinline></video>
 <div id="horizon"></div>
 <div id="ar"></div>
+<div id="hint">Drag sideways to align the compass</div>
 <div id="compass"><div id="ticks"></div></div>
 <div id="hud">
   <div id="status">…</div>
@@ -54,7 +56,7 @@
 </div>
 <div id="settings">
   <label>Camera field of view <span id="fovV"></span></label><input type="range" id="fov" min="30" max="90" step="1">
-  <label>Compass correction <span id="offV"></span></label><input type="range" id="off" min="-45" max="45" step="1">
+  <label>Compass correction <span id="offV"></span></label><input type="range" id="off" min="-90" max="90" step="1">
   <label>Search radius <span id="radV"></span></label><input type="range" id="rad" min="5" max="50" step="5">
   <label>Min. peak height <span id="minV"></span></label><input type="range" id="min" min="0" max="3000" step="100">
   <div class="row"><button onclick="reloadPeaks()">Reload peaks</button><button style="background:#333;color:#fff" onclick="settings.classList.remove('open')">Close</button></div>
@@ -68,22 +70,25 @@
 
 <script>
 // ---- config (persisted) ----
-const cfg = Object.assign({fov:40, off:0, rad:25, min:0}, JSON.parse(localStorage.cfg||'{}'));
-// iPhone portrait: 16:9 stream cropped by object-fit:cover shows only ~37-40° horizontally. Old default 55 was way off.
-if (cfg.v !== 2) { cfg.fov = 40; cfg.v = 2; localStorage.cfg = JSON.stringify(cfg); }
+const cfg = Object.assign({fov:35, off:0, rad:25, min:0}, JSON.parse(localStorage.cfg||'{}'));
+// iPhone portrait: sensor 69° long side, cropped by object-fit:cover to ~35° across the screen. Calibrated against PeakVisor.
+if (cfg.v !== 3) { cfg.fov = 35; cfg.v = 3; localStorage.cfg = JSON.stringify(cfg); }
+const shows = {};
 for (const k of ['fov','off','rad','min']) {
   const el = document.getElementById(k), v = document.getElementById(k+'V');
   el.value = cfg[k];
-  const show = () => v.textContent = k==='off'?`${cfg[k]>0?'+':''}${cfg[k]}°` : k==='fov'?`${cfg[k]}°` : k==='rad'?`${cfg[k]} km` : `${cfg[k]} m`;
+  const show = shows[k] = () => v.textContent = k==='off'?`${cfg[k]>0?'+':''}${cfg[k]}°` : k==='fov'?`${cfg[k]}°` : k==='rad'?`${cfg[k]} km` : `${cfg[k]} m`;
   show();
   el.oninput = () => { cfg[k] = +el.value; show(); localStorage.cfg = JSON.stringify(cfg); if (k==='rad'||k==='min') needFetch = true; };
 }
+function setOff(v) { cfg.off = Math.max(-90, Math.min(90, Math.round(v))); $('off').value = cfg.off; shows.off(); localStorage.cfg = JSON.stringify(cfg); }
 
 // ---- state ----
 const R = 6371000, D2R = Math.PI/180;
-let me = null;          // {lat, lon, ele}
-let heading = null, pitch = 0;
-let peaks = [];         // [{name, lat, lon, ele, bearing, dist, elevAng}]
+let me = null;          // {lat, lon, ele, dem}
+let basis = null;       // camera axes in East/North/Up: {X:right, Y:up, F:forward}
+let heading = null, yaw = 0, pitch = 0;
+let peaks = [];         // [{id, name, lat, lon, ele, bearing, dist, elevAng, vis}]
 let needFetch = true, fetchedAt = null, fetching = false;
 const $ = id => document.getElementById(id);
 
@@ -101,6 +106,7 @@ async function start() {
   window.addEventListener('deviceorientationabsolute', onOrient, true);
   window.addEventListener('deviceorientation', onOrient, true);
   requestAnimationFrame(render);
+  setTimeout(() => $('hint').remove(), 8000);
 }
 
 function watchGPS() {
@@ -110,61 +116,83 @@ function watchGPS() {
     $('status').innerHTML = 'Location blocked. Open in Safari/Chrome itself (not an in-app browser).'
       + '<br>iOS: Settings › Privacy › Location Services › Safari Websites › While Using; Settings › Safari › Location › Ask.'
       + '<br>Android: lock icon › Permissions › Location › Allow. '
-      + '<button onclick="watchGPS()" style="padding:4px 8px;margin-top:4px">Retry</button><br><small id="diag"></small>';
-    diag();
+      + '<button onclick="watchGPS()" style="padding:4px 8px;margin-top:4px">Retry</button>';
   }, {enableHighAccuracy:true, maximumAge:5000, timeout:20000});
 }
-async function diag() { // shown under the denied message: helps tell OS block vs per-site deny vs in-app browser
-  let perm = 'n/a';
-  try { perm = (await navigator.permissions.query({name:'geolocation'})).state; } catch {}
-  const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
-  $('diag').textContent = `perm=${perm} standalone=${standalone} secure=${isSecureContext} ua=${navigator.userAgent.slice(0,90)}`;
-}
 
+// ---- orientation → camera basis ----
 let gotAbsolute = false;
 function onOrient(e) {
   if (e.type === 'deviceorientationabsolute') gotAbsolute = true;
   else if (gotAbsolute) return; // prefer absolute stream on Android
   if (e.alpha == null) return;
   const a = e.alpha*D2R, b = e.beta*D2R, g = e.gamma*D2R;
-  // Direction the back camera points (device -Z) in East/North/Up frame; R = Rz(a)·Rx(b)·Ry(g)
-  const vx = -(Math.cos(a)*Math.sin(g) + Math.sin(a)*Math.sin(b)*Math.cos(g));
-  const vy = -(Math.sin(a)*Math.sin(g) - Math.cos(a)*Math.sin(b)*Math.cos(g));
-  const vz = -(Math.cos(b)*Math.cos(g));
-  pitch = Math.asin(Math.max(-1, Math.min(1, vz))) / D2R;
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+  // R = Rz(a)·Rx(b)·Ry(g); columns = device axes (X right, Y top, Z out of screen) in East/North/Up
+  const X = [ca*cg - sa*sb*sg, sa*cg + ca*sb*sg, -cb*sg];
+  const Y = [-sa*cb, ca*cb, sb];
+  const F = [-(ca*sg + sa*sb*cg), -(sa*sg - ca*sb*cg), -(cb*cg)]; // back camera looks along -Z
+  basis = {X, Y, F};
+  pitch = Math.asin(Math.max(-1, Math.min(1, F[2]))) / D2R;
+  const am = Math.atan2(F[0], F[1]) / D2R;                      // azimuth the matrix thinks the camera faces
   let h;
-  if (e.webkitCompassHeading != null) h = e.webkitCompassHeading;          // iOS: already true-north-ish, valid when upright
-  else if (e.absolute || e.type === 'deviceorientationabsolute') h = Math.atan2(vx, vy) / D2R;
-  else { status('Compass not absolute – heading unreliable'); h = Math.atan2(vx, vy) / D2R; }
-  // ponytail: no roll compensation; hold phone roughly level
+  if (e.webkitCompassHeading != null) h = e.webkitCompassHeading;  // iOS: alpha is not north-referenced, use compass
+  else { h = am; if (!(e.absolute || e.type === 'deviceorientationabsolute')) status('Compass not absolute – heading unreliable'); }
   heading = ((h + cfg.off) % 360 + 360) % 360;
+  yaw = ((heading - am + 540) % 360) - 180; // rotate the world by this before projecting through the matrix
 }
 
+// ---- drag sideways to align compass (PeakVisor-style manual mode) ----
+let drag = null;
+addEventListener('touchstart', e => { if (!e.target.closest('#hud,#settings,#start')) drag = {x:e.touches[0].clientX, off:cfg.off}; }, {passive:true});
+addEventListener('touchmove', e => { if (drag) setOff(drag.off - (e.touches[0].clientX - drag.x) / (innerWidth/cfg.fov)); }, {passive:true});
+addEventListener('touchend', () => drag = null);
+
+// ---- position ----
 async function onPos(p) {
   const {latitude:lat, longitude:lon, altitude:alt, accuracy} = p.coords;
   const first = !me;
-  me = {lat, lon, ele: me?.ele ?? alt ?? 0};
+  me = {lat, lon, ele: me?.ele ?? alt ?? 0, dem: me?.dem};
   $('pos').textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)} · ±${Math.round(accuracy)}m`;
   if (first || needFetch || dist(me, fetchedAt||me) > 3000) {
     needFetch = false;
-    groundElevation(lat, lon).then(e => { if (e != null) me.ele = e + 2; recompute(); });
+    groundElevation(lat, lon).then(e => { if (e != null) me.ele = e + 2; me.dem = true; recompute(); });
     loadPeaks(lat, lon);
   } else recompute();
 }
 
-// GPS altitude on phones is noisy/absent; use DEM lookup (open-meteo, free, no key). Falls back to GPS alt.
-async function groundElevation(lat, lon) {
-  try {
-    const r = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`);
-    return (await r.json()).elevation?.[0];
-  } catch { return null; }
+// ---- DEM: AWS Terrarium tiles (free, no key, CORS). Decoded once per tile into metres. ----
+const tiles = new Map();
+const zoom = () => cfg.rad <= 12 ? 12 : cfg.rad <= 25 ? 11 : 10;   // ~26 / 52 / 105 m per pixel at 46°N
+function tileXY(lat, lon, z) { const n = 2**z, φ = lat*D2R; return {x:(lon+180)/360*n, y:(1 - Math.log(Math.tan(φ) + 1/Math.cos(φ))/Math.PI)/2*n}; }
+function loadTile(z, tx, ty) {
+  const k = `${z}/${tx}/${ty}`;
+  if (!tiles.has(k)) tiles.set(k, new Promise((res, rej) => {
+    const img = new Image(); img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const c = document.createElement('canvas'); c.width = c.height = 256;
+      const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0);
+      const d = ctx.getImageData(0, 0, 256, 256).data, e = new Float32Array(65536);
+      for (let i = 0; i < 65536; i++) e[i] = d[i*4]*256 + d[i*4+1] + d[i*4+2]/256 - 32768;
+      res(e);
+    };
+    img.onerror = () => { tiles.delete(k); rej(new Error('tile ' + k)); };
+    img.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${k}.png`;
+  }));
+  return tiles.get(k);
 }
+async function elevAt(lat, lon, z = zoom()) {
+  const {x, y} = tileXY(lat, lon, z), e = await loadTile(z, Math.floor(x), Math.floor(y));
+  return e[Math.floor((y%1)*256)*256 + Math.floor((x%1)*256)];
+}
+// GPS altitude on phones is noisy/absent; use the DEM. Falls back to GPS alt.
+async function groundElevation(lat, lon) { try { return await elevAt(lat, lon, 12); } catch { return null; } }
 
 function reloadPeaks() { settings.classList.remove('open'); if (me) loadPeaks(me.lat, me.lon, true); }
 
 async function loadPeaks(lat, lon, force) {
   if (fetching) return;
-  const key = `peaks:${lat.toFixed(2)},${lon.toFixed(2)},${cfg.rad}`;
+  const key = `peaks2:${lat.toFixed(2)},${lon.toFixed(2)},${cfg.rad}`;
   const cached = !force && localStorage.getItem(key);
   if (cached) { peaks = JSON.parse(cached); fetchedAt = {lat, lon}; recompute(); status(`${peaks.length} peaks (cached)`); return; }
   fetching = true; status('Loading peaks from OpenStreetMap…');
@@ -175,7 +203,7 @@ async function loadPeaks(lat, lon, force) {
       const r = await fetch(url, {method:'POST', body:'data='+encodeURIComponent(q)});
       if (!r.ok) throw new Error(r.status);
       const j = await r.json();
-      peaks = j.elements.map(n => ({name:n.tags.name, lat:n.lat, lon:n.lon, ele:parseFloat(String(n.tags.ele).replace(',','.'))})).filter(p => isFinite(p.ele));
+      peaks = j.elements.map(n => ({id:n.id, name:n.tags.name, lat:n.lat, lon:n.lon, ele:parseFloat(String(n.tags.ele).replace(',','.'))})).filter(p => isFinite(p.ele));
       fetchedAt = {lat, lon};
       try { localStorage.setItem(key, JSON.stringify(peaks)); } catch {}
       recompute(); status(`${peaks.length} peaks within ${cfg.rad} km`);
@@ -195,15 +223,45 @@ function bearing(a, b) {
   const y=Math.sin(dλ)*Math.cos(φ2), x=Math.cos(φ1)*Math.sin(φ2)-Math.sin(φ1)*Math.cos(φ2)*Math.cos(dλ);
   return (Math.atan2(y,x)/D2R+360)%360;
 }
+// elevation angle of a point at height h, distance d, incl. earth curvature + standard refraction (k≈0.13)
+const elevAngle = (h, d) => Math.atan2(h - me.ele - d*d/(2*R)*(1-0.13), d)/D2R;
 function recompute() {
   if (!me) return;
-  for (const p of peaks) {
-    p.dist = dist(me, p); p.bearing = bearing(me, p);
-    // elevation angle incl. earth curvature + standard refraction (k≈0.13)
-    const drop = p.dist*p.dist/(2*R)*(1-0.13);
-    p.elevAng = Math.atan2(p.ele - me.ele - drop, p.dist)/D2R;
-  }
+  for (const p of peaks) { p.dist = dist(me, p); p.bearing = bearing(me, p); p.elevAng = elevAngle(p.ele, p.dist); }
   peaks.sort((a,b) => a.dist-b.dist);
+  occlude();
+}
+
+// ---- terrain occlusion: walk the DEM along each sightline; hide peaks behind higher ground ----
+let occAt = null, occBusy = false;
+async function occlude() {
+  if (!me?.dem || !peaks.length || occBusy) return;
+  if (occAt && dist(me, occAt) >= 300) for (const p of peaks) p.vis = null;
+  if (peaks.every(p => p.vis != null)) return;
+  occBusy = true;
+  const snap = peaks, at = occAt = {lat: me.lat, lon: me.lon};
+  const z = zoom(), step = z === 12 ? 60 : z === 11 ? 100 : 150;
+  status(`Checking ${snap.length} peaks against terrain…`);
+  try {
+    let n = 0;
+    for (const p of snap) {
+      if (snap !== peaks) break;
+      if (p.vis != null) continue;
+      let vis = true;
+      for (let d = 200; d < p.dist - 200; d += step) {   // stop short of the summit: DEM smooths sharp tops
+        const t = d/p.dist;
+        if (elevAngle(await elevAt(at.lat + (p.lat-at.lat)*t, at.lon + (p.lon-at.lon)*t, z), d) > p.elevAng + 1.5) { vis = false; break; }   // 1.5°: DEM is ~30-50 m and smooths cliffs; false hides feel worse than extra labels
+      }
+      p.vis = vis;
+      if (++n % 20 === 0) await new Promise(r => setTimeout(r));   // let the camera frame render
+    }
+    if (snap === peaks) status(`${snap.filter(p => p.vis).length} of ${snap.length} peaks visible from here`);
+  } catch (e) {
+    console.warn('occlusion', e); status('Terrain download failed – showing all peaks');
+    for (const p of snap) if (p.vis == null) p.vis = true;
+  }
+  occBusy = false;
+  if (snap !== peaks) occlude();
 }
 
 // ---- render ----
@@ -213,36 +271,32 @@ const ar = $('ar'), ticks = $('ticks'), hdgEl = $('hdg');
   for (let d = -360; d < 720; d += 15) h += d%90===0 ? `<span data-d="${d}">${N[(d+360)%360]}</span>` : `<i data-d="${d}"></i>`;
   ticks.innerHTML = h;
 })();
-const PX_PER_DEG = () => innerWidth / cfg.fov;
 const labelCache = new Map();
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
 
 function render() {
   requestAnimationFrame(render);
-  if (heading == null) return;
+  if (!basis) return;
+  const {X, Y, F} = basis;
   hdgEl.textContent = `${Math.round(heading)}° ${['N','NE','E','SE','S','SW','W','NW'][Math.round(heading/45)%8]}`;
-  const ppd = PX_PER_DEG(), W = innerWidth, H = innerHeight;
-  // compass strip
+  const W = innerWidth, H = innerHeight, f = (W/2)/Math.tan(cfg.fov/2*D2R), ppd = W/cfg.fov;
   for (const el of ticks.children) el.style.left = (( +el.dataset.d - heading) * ppd*0.6) + 'px';
-  // horizon line
-  $('horizon').style.top = (H/2 + pitch*ppd) + 'px';
-  // peaks
-  const halfFov = cfg.fov/2 + 4;
-  const seen = new Set(), placed = [];
-  // candidates in view, most prominent-looking (highest above horizon) first
+  $('horizon').style.top = (H/2 + f*Math.tan(pitch*D2R)) + 'px';
+  // pinhole projection of every visible peak through the device rotation matrix (handles pitch and roll)
   const cand = [];
   for (const p of peaks) {
-    if (p.dist == null || p.ele < cfg.min || p.dist < 150) continue;
-    let rel = p.bearing - heading; rel = ((rel + 540) % 360) - 180;
-    if (Math.abs(rel) > halfFov) continue;
-    const x = W/2 + rel*ppd, y = H/2 - (p.elevAng - pitch)*ppd;
-    if (y < -50 || y > H + 50) continue;
+    if (p.vis !== true || p.ele < cfg.min || p.dist < 150) continue;
+    const b = (p.bearing - yaw)*D2R, e = p.elevAng*D2R, ce = Math.cos(e);
+    const d = [Math.sin(b)*ce, Math.cos(b)*ce, Math.sin(e)];
+    const pz = dot(d, F); if (pz < 0.3) continue;
+    const x = W/2 + f*dot(d, X)/pz, y = H/2 - f*dot(d, Y)/pz;
+    if (x < -60 || x > W+60 || y < -50 || y > H+50) continue;
     cand.push({p, x, y});
   }
-  cand.sort((a, b) => b.p.elevAng - a.p.elevAng);
+  cand.sort((a, b) => b.p.elevAng - a.p.elevAng); // most prominent-looking first
+  const seen = new Set(), placed = [];
   for (const {p, x, y} of cand) {
-    // ponytail: no terrain occlusion (needs DEM raycasting); greedy label collision instead
-    const w = p.name.length*7.5 + 24, h = 68;
-    const r = {l:x-w/2, r:x+w/2, t:y-h, b:y};
+    const w = p.name.length*7.5 + 24, h = 68, r = {l:x-w/2, r:x+w/2, t:y-h, b:y};
     if (placed.some(q => r.l < q.r && r.r > q.l && r.t < q.b && r.b > q.t)) continue;
     placed.push(r);
     if (placed.length > 25) break;
