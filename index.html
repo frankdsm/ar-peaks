@@ -68,7 +68,9 @@
 
 <script>
 // ---- config (persisted) ----
-const cfg = Object.assign({fov:55, off:0, rad:25, min:0}, JSON.parse(localStorage.cfg||'{}'));
+const cfg = Object.assign({fov:40, off:0, rad:25, min:0}, JSON.parse(localStorage.cfg||'{}'));
+// iPhone portrait: 16:9 stream cropped by object-fit:cover shows only ~37-40° horizontally. Old default 55 was way off.
+if (cfg.v !== 2) { cfg.fov = 40; cfg.v = 2; localStorage.cfg = JSON.stringify(cfg); }
 for (const k of ['fov','off','rad','min']) {
   const el = document.getElementById(k), v = document.getElementById(k+'V');
   el.value = cfg[k];
@@ -224,18 +226,26 @@ function render() {
   // horizon line
   $('horizon').style.top = (H/2 + pitch*ppd) + 'px';
   // peaks
-  const halfFov = cfg.fov/2 + 4, cols = {};
-  let shown = 0;
-  const seen = new Set();
+  const halfFov = cfg.fov/2 + 4;
+  const seen = new Set(), placed = [];
+  // candidates in view, most prominent-looking (highest above horizon) first
+  const cand = [];
   for (const p of peaks) {
     if (p.dist == null || p.ele < cfg.min || p.dist < 150) continue;
     let rel = p.bearing - heading; rel = ((rel + 540) % 360) - 180;
     if (Math.abs(rel) > halfFov) continue;
     const x = W/2 + rel*ppd, y = H/2 - (p.elevAng - pitch)*ppd;
     if (y < -50 || y > H + 50) continue;
-    if (++shown > 40) break;
-    // ponytail: no terrain occlusion (needs DEM raycasting); stack overlapping labels instead
-    const col = Math.round(x/64); const n = cols[col] = (cols[col]||0) + 1;
+    cand.push({p, x, y});
+  }
+  cand.sort((a, b) => b.p.elevAng - a.p.elevAng);
+  for (const {p, x, y} of cand) {
+    // ponytail: no terrain occlusion (needs DEM raycasting); greedy label collision instead
+    const w = p.name.length*7.5 + 24, h = 68;
+    const r = {l:x-w/2, r:x+w/2, t:y-h, b:y};
+    if (placed.some(q => r.l < q.r && r.r > q.l && r.t < q.b && r.b > q.t)) continue;
+    placed.push(r);
+    if (placed.length > 25) break;
     let el = labelCache.get(p);
     if (!el) {
       el = document.createElement('div'); el.className = 'pk';
@@ -246,7 +256,6 @@ function render() {
     el.classList.toggle('far', p.dist > 12000);
     el.querySelector('small').textContent = `${Math.round(p.ele)} m · ${(p.dist/1000).toFixed(1)} km`;
     el.style.left = x + 'px'; el.style.top = y + 'px';
-    el.style.paddingBottom = ((n-1)*40) + 'px';
     el.style.zIndex = 1000 - Math.round(p.dist/100);
     seen.add(p);
   }
